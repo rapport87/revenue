@@ -1,6 +1,10 @@
 from bs4 import BeautifulSoup
 from langchain_community.document_loaders import AsyncHtmlLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.text_splitter import (
+    RecursiveCharacterTextSplitter,
+    CharacterTextSplitter,
+)
+from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain.vectorstores.faiss import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain.embeddings import CacheBackedEmbeddings
@@ -10,6 +14,11 @@ from langchain_openai import ChatOpenAI
 from langchain.storage import LocalFileStore
 from langchain_community.document_loaders import SeleniumURLLoader
 import streamlit as st
+import os
+
+os.makedirs("./.cache/files", exist_ok=True)
+file_path = "./.cache/files/container.txt"
+cache_dir = LocalFileStore("./.cache/embeddings/revenue")
 
 llm = ChatOpenAI(
     temperature=0.1,
@@ -138,23 +147,21 @@ def get_urls():
     urls = [a.get("href") for a in soup.find_all("a", href=True)]
     filtered_urls = [url for url in urls if url.startswith("/nts")]
     filtered_urls = list(set(filtered_urls))
-    target_urls = [f"https://nts.go.kr{filtered_url}" for filtered_url in filtered_urls]
-    # target_urls = [
-    #     "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=2265&cntntsId=7690",
-    #     "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=2272&cntntsId=7693",
-    # ]
+    # target_urls = [f"https://nts.go.kr{filtered_url}" for filtered_url in filtered_urls]
+    target_urls = [
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=2265&cntntsId=7690",
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=2272&cntntsId=7693",
+    ]
     return target_urls
 
 
-@st.cache_resource()
+@st.cache_data(show_spinner="Embedding file...")
 def load_website(target_urls):
     loader = AsyncHtmlLoader(target_urls)
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=1200,
-        chunk_overlap=400,
+        chunk_size=2000,
+        chunk_overlap=200,
     )
-    cache_dir = LocalFileStore("./.cache/embeddings/revenue")
-
     loader.requests_per_second = 1
     docs = loader.load()
     container = ""
@@ -173,20 +180,32 @@ def load_website(target_urls):
         if container != "":
             container = container + "\n\n"
 
-        container = container + (
+        container = (
             soup.find(id="container").get_text().replace("\n", " ").replace("\xa0", " ")
         )
 
-    result_text = splitter.split_text(container)
+        with open(file_path, "a", encoding="utf-8") as file:
+            result_text = splitter.split_text(container)
+            if result_text:
+                # 리스트의 항목을 하나의 문자열로 결합
+                combined_text = " ".join(result_text)
+                file.write(combined_text)
+                file.write("\n\n---\n\n")
 
+    loader = UnstructuredFileLoader(file_path)
+    result = loader.load_and_split(text_splitter=splitter)
     embeddings = OpenAIEmbeddings()
     cached_embeddings = CacheBackedEmbeddings.from_bytes_store(embeddings, cache_dir)
-    vector_store = FAISS.from_texts(result_text, cached_embeddings)
-    return vector_store.as_retriever()
+    vector_store = FAISS.from_documents(result, cached_embeddings)
+    vector_store.as_retriever()
+    return result
 
 
 urls = get_urls()
 retriever = load_website(urls)
+
+if retriever:
+    st.write("Loaded successfully")
 
 st.markdown(
     """
@@ -200,15 +219,15 @@ st.markdown(
 """
 )
 
-query = st.text_input("국세청 홈페이지에서 검색할 내용을 입력하세요.")
-if query:
-    chain = (
-        {
-            "docs": retriever,
-            "question": RunnablePassthrough(),
-        }
-        | RunnableLambda(get_answers)
-        | RunnableLambda(choose_answer)
-    )
-    result = chain.invoke(query)
-    st.markdown(result.content.replace("$", "\$"))
+# query = st.text_input("국세청 홈페이지에서 검색할 내용을 입력하세요.")
+# if query:
+#     chain = (
+#         {
+#             "docs": retriever,
+#             "question": RunnablePassthrough(),
+#         }
+#         | RunnableLambda(get_answers)
+#         | RunnableLambda(choose_answer)
+#     )
+#     result = chain.invoke(query)
+#     st.markdown(result.content.replace("$", "\$"))
