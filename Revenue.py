@@ -2,7 +2,6 @@ from bs4 import BeautifulSoup
 from langchain_community.document_loaders import AsyncHtmlLoader
 from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
-    CharacterTextSplitter,
 )
 from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain.vectorstores.faiss import FAISS
@@ -12,83 +11,57 @@ from langchain.schema.runnable import RunnableLambda, RunnablePassthrough
 from langchain.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain.storage import LocalFileStore
-from langchain_community.document_loaders import SeleniumURLLoader
+from langchain.callbacks.base import BaseCallbackHandler
 import streamlit as st
 import os
 
 os.makedirs("./.cache/files", exist_ok=True)
 file_path = "./.cache/files/container.txt"
 cache_dir = LocalFileStore("./.cache/embeddings/revenue")
+splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    chunk_size=2000,
+    chunk_overlap=200,
+)
+
+st.set_page_config(
+    page_title="국세청 GPT",
+    page_icon="📃",
+)
+
+
+class ChatCallbackHandler(BaseCallbackHandler):
+    message = ""
+
+    def on_llm_start(self, *args, **kwargs):
+        self.message_box = st.empty()
+
+    def on_llm_end(self, *args, **kwargs):
+        save_message(self.message, "ai")
+
+    def on_llm_new_token(self, token, *args, **kwargs):
+        self.message += token
+        self.message_box.markdown(self.message)
+
 
 llm = ChatOpenAI(
     temperature=0.1,
     model_name="gpt-3.5-turbo-0125",
+    streaming=True,
+    callbacks=[
+        ChatCallbackHandler(),
+    ],
 )
 
-answers_prompt = ChatPromptTemplate.from_template(
-    """
-    오직 정보에 있는 내용만 사용하여 사용자의 질문에 답하세요
-    만일 정보에 적절한 답변이 없다면, 다른 작업을 하지 말고, "모르겠습니다"라고 답하세요.
-    
-    그후, 답변의 점수를 0에서 5 사이로 매기세요.
-
-    답변이 사용자의 질문에 대한 답변이라면 점수는 높아야 하고, 그렇지 않다면 낮아야 합니다.
-
-    답변의 점수가 0이더라도 항상 포함되도록 하세요.
-
-    정보: {context}
-                                                  
-    예제:
-    -----         
-    정보: 지구에서 달까지의 거리는 384,400 Km 떨어져 있습니다.
-
-    질문: 지구에서 달까지 얼마나 떨어져 있나요?
-    답변: 달은 384,400 km 떨어져 있습니다.
-    점수: 5
-
-    질문 : 지구에서 달까지는 얼마나 떨어져 있나요?
-    답변 : 지구와 달은 멀리 떨어져 있습니다
-    점수 : 3
-
-    질문: 지구에서 태양까지 얼마나 떨어져 있나요?
-    답변: 모르겠습니다
-    점수: 0
-    -----
-
-    위의 예제를 참고하여 답변하세요.
-
-    질문: {question}
-"""
-)
-
-
-def get_answers(inputs):
-    docs = inputs["docs"]
-    question = inputs["question"]
-    answers_chain = answers_prompt | llm
-    return {
-        "question": question,
-        "answers": [
-            {
-                "answer": answers_chain.invoke(
-                    {"question": question, "context": doc.page_content}
-                ).content
-            }
-            for doc in docs
-        ],
-    }
-
-
-choose_prompt = ChatPromptTemplate.from_messages(
+prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             """
-            기존에 존재하는 답변만 사용하여 사용자의 질문에 답하세요.
-
-            내용이 가장 자세하고 점수가 높은 답변을 선택하세요.
-
-            답변: {answers}
+            되도록 context의 내용을 사용하여 답변하세요
+            답변할 수 없는 질문에는 답변을 만들어내지 마세요
+            답변할 수 없다면 '질문에 대한 내용이 없습니다' 라고 답변하세요.
+            
+            Context: {context}
             """,
         ),
         ("human", "{question}"),
@@ -96,84 +69,21 @@ choose_prompt = ChatPromptTemplate.from_messages(
 )
 
 
-def choose_answer(inputs):
-    answers = inputs["answers"]
-    question = inputs["question"]
-    choose_chain = choose_prompt | llm
-    condensed = "\n\n".join(f"{answer['answer']}\n" for answer in answers)
-    return choose_chain.invoke(
-        {
-            "question": question,
-            "answers": condensed,
-        }
-    )
-
-
-def parse_page(soup):
-    header = soup.find("header")
-    footer = soup.find("footer")
-    if header:
-        header.decompose()
-    if footer:
-        footer.decompose()
-    return str(soup.get_text()).replace("\n", " ").replace("\xa0", " ")
-
-
-def filter_fn(document):
-    soup = BeautifulSoup(document.content, "html.parser")
-
-    # 헤더와 푸터 제거
-    header = soup.find("header")
-    footer = soup.find("footer")
-    if header:
-        header.extract()
-    if footer:
-        footer.extract()
-
-    return str(soup.get_text())
-
-
-@st.cache_resource()
-def get_urls():
-    url = "https://www.nts.go.kr/nts/nurisitemap.do?mi=6789"
-    loader = AsyncHtmlLoader(url)
-    docs = loader.load()
-    print("Extracting content with LLM")
-
-    html_content = docs[0].page_content
-
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    urls = [a.get("href") for a in soup.find_all("a", href=True)]
-    filtered_urls = [url for url in urls if url.startswith("/nts")]
-    filtered_urls = list(set(filtered_urls))
-    # target_urls = [f"https://nts.go.kr{filtered_url}" for filtered_url in filtered_urls]
-    target_urls = [
-        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=2265&cntntsId=7690",
-        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=2272&cntntsId=7693",
-    ]
-    return target_urls
-
-
 @st.cache_data(show_spinner="Embedding file...")
 def load_website(target_urls):
     loader = AsyncHtmlLoader(target_urls)
-    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=2000,
-        chunk_overlap=200,
-    )
     loader.requests_per_second = 1
     docs = loader.load()
     container = ""
     for doc in docs:
-        html_content = doc.page_content  # 각 문서의 HTML 내용
+        html_content = doc.page_content
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # class 이름이 'locationWrap'인 모든 요소를 찾아서 제거합니다.
+        # class명이 'locationWrap'인 요소 제거
         for location_wrap in soup.find_all(class_="locationWrap"):
             location_wrap.decompose()
 
-        # class 이름이 'zoomBox'인 모든 요소를 찾아서 제거합니다.
+        # class명이 'zoomBox'인 요소 제거
         for zoom_box in soup.find_all(class_="zoomBox"):
             zoom_box.decompose()
 
@@ -192,42 +102,114 @@ def load_website(target_urls):
                 file.write(combined_text)
                 file.write("\n\n---\n\n")
 
+
+def get_contents():
     loader = UnstructuredFileLoader(file_path)
     result = loader.load_and_split(text_splitter=splitter)
     embeddings = OpenAIEmbeddings()
     cached_embeddings = CacheBackedEmbeddings.from_bytes_store(embeddings, cache_dir)
     vector_store = FAISS.from_documents(result, cached_embeddings)
-    vector_store.as_retriever()
-    return result
+    retriever = vector_store.as_retriever()
+    return retriever
 
 
-urls = get_urls()
-retriever = load_website(urls)
+def get_urls():
+    url = [
+        "https://www.nts.go.kr/nts/nurisitemap.do?mi=6789",  # 전체포탈
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=12242&cntntsId=8631",  # 지급명세서 제출
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6769&cntntsId=8165",  # 근로소득
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6441&cntntsId=7877",  # 퇴직소득
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6449&cntntsId=7885",  # 연금소득
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6454&cntntsId=7890",  # 기타소득
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6464&cntntsId=7900",  # 사업소득
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6469&cntntsId=7905",  # 금융(이자·배당)소득
+        "https://www.nts.go.kr/nts/cm/cntnts/cntntsView.do?mi=6480&cntntsId=7916",  # 비거주자 원천징수
+    ]
+    loader = AsyncHtmlLoader(url)
+    docs = loader.load()
+    print("Extracting content with LLM")
 
-if retriever:
-    st.write("Loaded successfully")
+    all_urls = []
+
+    for doc in docs:
+        html_content = doc.page_content
+        soup = BeautifulSoup(html_content, "html.parser")
+        urls = [a.get("href") for a in soup.find_all("a", href=True)]
+        filtered_urls = [url for url in urls if url.startswith("/nts")]
+        filtered_urls = list(set(filtered_urls))
+        all_urls += filtered_urls
+        target_urls = [f"https://nts.go.kr{all_url}" for all_url in all_urls]
+    target_urls = list(set(target_urls))
+    return target_urls
+
+
+def paint_history():
+    for message in st.session_state["messages"]:
+        send_message(
+            message["message"],
+            message["role"],
+            save=False,
+        )
+
+
+def save_message(message, role):
+    st.session_state["messages"].append({"message": message, "role": role})
+
+
+def send_message(message, role, save=True):
+    with st.chat_message(role):
+        st.markdown(message)
+    if save:
+        save_message(message, role)
+
+
+def format_docs(docs):
+    return "\n\n".join(document.page_content for document in docs)
+
+
+def reload_page():
+    st.experimental_rerun()
+
+
+# 초기화 버튼
+if st.button("초기화"):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    reload_page()
+
+st.title("국세청AI")
 
 st.markdown(
     """
 안녕하세요!
             
-국세청에서 제공하는 정보를 검색할 수 있는 Renenue 챗봇입니다
-
-아래에 검색할 내용을 입력하시면,
-
-국세청 홈페이지에서 검색하여 답변을 제공해드립니다.
-"""
+국세청 사이트의 내용을 AI에게 질문을 할 수 있는 국세청AI(ChatGPT3.5) 입니다
+    """
 )
 
-# query = st.text_input("국세청 홈페이지에서 검색할 내용을 입력하세요.")
-# if query:
-#     chain = (
-#         {
-#             "docs": retriever,
-#             "question": RunnablePassthrough(),
-#         }
-#         | RunnableLambda(get_answers)
-#         | RunnableLambda(choose_answer)
-#     )
-#     result = chain.invoke(query)
-#     st.markdown(result.content.replace("$", "\$"))
+if not os.path.exists(file_path):
+    final_urls = get_urls()
+    contents = load_website(final_urls)
+
+
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+
+retriever = get_contents()
+
+if retriever:
+    send_message("준비되었습니다 무엇이든 물어보세요", "ai", save=False)
+    paint_history()
+    message = st.chat_input("국세청에 대해 궁금한것을 물어보세요")
+    if message:
+        send_message(message, "human")
+        chain = (
+            {
+                "context": retriever | RunnableLambda(format_docs),
+                "question": RunnablePassthrough(),
+            }
+            | prompt
+            | llm
+        )
+        with st.chat_message("ai"):
+            chain.invoke(message)
